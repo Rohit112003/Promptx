@@ -1,0 +1,375 @@
+===============================================================================
+ TOKENISED FUND SERVICING PLATFORM — HOW IT ALL WORKS (FRONT TO BACK)
+ A plain-language walkthrough of every layer, and exactly how the backend
+ talks to the blockchain (addresses, keys, signing, "money"/units, gas).
+===============================================================================
+
+Read this top to bottom once. It follows a single request all the way down to
+the blockchain and back, then explains each service. File paths are given so
+you can open the code next to this.
+
+
+-------------------------------------------------------------------------------
+ 0. THE ONE-PARAGRAPH SUMMARY
+-------------------------------------------------------------------------------
+A fund is divided into UNITS (like shares). A smart contract on a blockchain is
+the OFFICIAL record of who owns how many units, what the fund is worth (NAV),
+and the price per unit. A Python backend (FastAPI) sits in front of that
+contract. It checks who you are (JWT login), checks your role (admin / agent /
+custodian / auditor / investor), then performs the action by sending a signed
+transaction to the contract. It also keeps a normal database (SQLite) as a
+fast, searchable COPY with human names attached, and it listens to blockchain
+events to build an audit trail. The blockchain is the truth; the database is a
+convenience layer.
+
+
+-------------------------------------------------------------------------------
+ 1. THE LAYERS (who does what in the code)
+-------------------------------------------------------------------------------
+Request comes in at the top and travels down:
+
+  HTTP request (Swagger / frontend / curl)
+        |
+  [Routers]        backend/app/api/v1/*.py
+        |          - Define the URLs (e.g. POST /orders/subscribe)
+        |          - Validate input (addresses, positive amounts) via schemas
+        |          - Enforce login + role (Depends(require_roles(...)))
+        v
+  [Services]       backend/app/services/*.py
+        |          - The business logic ("subscribe means: create an order,
+        |            then record it, then return it")
+        v
+  [Contract        backend/app/blockchain/contract.py
+   Gateway]        - Typed methods like create_subscription(investor, units)
+        |          - Decides WHICH account signs the transaction
+        v
+  [Web3 Client]    backend/app/blockchain/client.py
+        |          - The actual blockchain connection
+        |          - Builds, signs, and sends transactions; waits for receipts
+        |          - Turns blockchain errors into friendly HTTP errors
+        v
+  [Smart Contract] contracts/TokenisedFundServicing.sol   <-- SOURCE OF TRUTH
+        |          - Holds balances, orders, NAV, custody, roles
+        |          - Emits events for everything that happens
+        v
+  [Database]       backend/app/repositories/*.py  (SQLite by default)
+        |          - Stores enriched copies: investor names/emails, order notes,
+        |            an index of every event (for search + audit)
+        v
+  [Event Listener] backend/app/blockchain/event_listener.py
+                   - Runs in the background, reads events off the chain,
+                     saves them to the DB, and pushes them to /ws/events
+
+Supporting pieces:
+  - backend/app/config.py         all settings + the dev keys
+  - backend/app/core/security.py  JWT login + role checks
+  - backend/app/core/errors.py    consistent error format + revert mapping
+  - backend/app/core/context.py   wires everything together at startup
+  - backend/app/blockchain/accounts.py   the addresses/keys and role mapping
+
+
+-------------------------------------------------------------------------------
+ 2. WHAT HAPPENS WHEN THE SERVER STARTS (startup sequence)
+-------------------------------------------------------------------------------
+Entry point: `python -m app`  ->  backend/app/__main__.py  ->  uvicorn runs
+backend/app/main.py which defines `app` (a FastAPI object).
+
+On startup, main.py's `lifespan()` runs build_context() (core/context.py):
+
+  1. Create the ChainClient and call client.connect().
+     - If CHAIN_MODE=inmemory: start an in-process blockchain (eth-tester),
+       fund the dev accounts, and DEPLOY the contract right there.
+     - If CHAIN_MODE=hardhat: connect to the running node at RPC_URL and read
+       the already-deployed contract address from deployments/local.json.
+  2. Build the ContractGateway around the client.
+  3. Connect the database (SQLite by default) via build_repository().
+  4. Create the WebSocket manager and the EventListener.
+  5. Create all services (investor, order, nav, custody, report, audit, health).
+  6. Start the EventListener in the background (it backfills from block 0).
+
+After this, the API is ready and every request can reach the contract + DB.
+
+
+-------------------------------------------------------------------------------
+ 3. ADDRESSES AND KEYS  (the most important part to understand)
+-------------------------------------------------------------------------------
+On a blockchain, every account is:
+  - an ADDRESS  (public, like an account number:  0x70997970C518...79C8)
+  - a PRIVATE KEY (secret; whoever has it can sign/act as that address)
+
+Normally each user keeps their own private key in a wallet (e.g. MetaMask) and
+signs their own transactions. You said: no MetaMask, no wallet, no real funds.
+So this demo uses a well-known trick:
+
+  THE BACKEND HOLDS THE PRIVATE KEYS and signs transactions on everyone's behalf.
+
+The keys are the standard, PUBLIC Hardhat development keys (worthless test keys,
+safe to commit). They live in config.py (and .env.example) and are loaded by
+backend/app/blockchain/accounts.py into `DevAccounts`, which assigns a job to
+each of the 10 accounts:
+
+  Account 0  -> admin        (ADMIN_ROLE)
+  Account 1  -> agent        (TRANSFER_AGENT_ROLE)
+  Account 2  -> custodian    (CUSTODIAN_ROLE)
+  Account 3  -> auditor      (AUDITOR_ROLE)
+  Account 4  -> investor1    (INVESTOR)
+  ...
+  Account 8  -> investor5    (INVESTOR)
+
+So when you "log in as agent", the backend already has the agent's private key.
+When you settle an order, the backend signs that transaction with the agent's
+key. When investor1 subscribes, the backend signs with investor1's key. This is
+why the demo needs no wallet: the addresses and their keys are all built in.
+
+`DevAccounts` also gives us:
+  - for_role(role)      -> the account that should sign a given action
+  - for_address(addr)   -> the account/key for a specific investor address
+  - demo_users()        -> the username -> {role, address} map used by login
+
+
+-------------------------------------------------------------------------------
+ 4. "MONEY", UNITS, NAV, AND PRICE  (how value is represented)
+-------------------------------------------------------------------------------
+There are TWO different kinds of value here — don't mix them up:
+
+ (a) UNITS = the fund shares. THIS is the asset investors own.
+     - Stored on-chain as  investorBalance[address]  (a plain integer count).
+     - totalSupply = sum of everyone's units.
+     - Buying (subscribing) MINTS new units to you; selling (redeeming) BURNS them.
+
+ (b) ETH (the blockchain's native coin) = ONLY used to pay gas (transaction fees).
+     - In inmemory mode the backend funds each dev account with 1000 fake ETH.
+     - In hardhat mode the node pre-funds them with fake ETH.
+     - This ETH is NOT the fund's money; it's just fuel to run transactions.
+
+Where's the "cash" an investor pays to buy units? In this demo it is MODELLED,
+not actually transferred. A subscription simply:
+     - adds units to the investor,
+     - increases totalSupply,
+     - increases the fund's recorded NAV by (units x price).
+In a real product you would connect a real payment or a stablecoin transfer at
+this step. Here we keep it self-contained so it runs with no real money.
+
+PRICE MATH (all in the contract, contracts/TokenisedFundServicing.sol):
+     - navTotal   = total fund value in whole dollars (e.g. 170100 = $170,100)
+     - unitPrice  = navTotal * PRICE_SCALE / totalSupply
+     - PRICE_SCALE = 100,000,000 (1e8). It gives 8 decimal places of precision
+       because Solidity has no decimals. So a stored unitPrice of 11340000000
+       means $113.40  (11340000000 / 1e8).
+     - When totalSupply is 0, price falls back to initialUnitPrice ($100.00).
+     - updateNAV can only move the NAV by up to +/-20% at a time (a safety rail).
+
+So: portfolioValue(address) = investorBalance * unitPrice / PRICE_SCALE (dollars).
+
+
+-------------------------------------------------------------------------------
+ 5. HOW THE BACKEND ACTUALLY TALKS TO THE BLOCKCHAIN
+-------------------------------------------------------------------------------
+Everything goes through backend/app/blockchain/client.py. There are two kinds
+of interaction:
+
+ A) READS (view calls) — free, no signing, no gas.
+    Example: "what is investor X's balance?"
+    Code path: gateway.get_investor(addr) -> client.read(contract.functions
+    .getInvestor(addr)) -> contract.functions...call(). It just asks the chain
+    and returns the answer. No transaction is created.
+
+ B) WRITES (transactions) — change state, must be signed, cost gas.
+    Example: "settle order #5". This is where addresses/keys/gas come in.
+
+    The write path (client._send_sync), step by step:
+
+      1. Pick the signer account (an address + its private key). The gateway
+         decides this: agent for KYC/NAV/settle, custodian for custody,
+         admin for pause, or the specific investor for subscribe/redeem/transfer.
+
+      2. estimate_gas: ask the chain how much gas this call will need. If the
+         call would fail (e.g. "investor not approved"), the chain rejects it
+         HERE, and we convert that into a clean HTTP error (see section 7).
+
+      3. Build the transaction dictionary:
+            {
+              from:     signer.address,
+              nonce:    how many txs this address has already sent (prevents
+                        replay/ordering bugs),
+              gas:      estimate + a safety margin,
+              gasPrice: current price of gas,
+              chainId:  which network (31337 locally),
+              to/data:  (filled by web3 from the function + arguments)
+            }
+
+      4. Sign it with the signer's PRIVATE KEY:  signer.sign_transaction(tx).
+         This produces raw signed bytes that prove this account authorised it.
+
+      5. Send the raw signed bytes:  w3.eth.send_raw_transaction(...).
+         The chain executes the contract function, updates state, and mines a block.
+
+      6. Wait for the RECEIPT:  wait_for_transaction_receipt(...). The receipt
+         contains the transaction hash, the block number, gas used, and a
+         status (1 = success). We return these to the caller.
+
+    Concurrency safety: all writes go through a single asyncio.Lock (client.send)
+    so two transactions from the same account can't grab the same nonce and clash.
+
+    Deploy + roles at startup (inmemory): client._deploy() sends the contract's
+    bytecode as a transaction (signed by admin) to create the contract, then
+    client._grant_roles_sync() sends grantRole transactions so agent/custodian/
+    auditor get their powers. The resulting address + ABI are saved to
+    deployments/local.json.
+
+
+-------------------------------------------------------------------------------
+ 6. A FULL END-TO-END TRACE:  investor1 subscribes for 50 units, agent settles
+-------------------------------------------------------------------------------
+STEP 1 — LOGIN (get a token that proves who you are)
+
+
+  POST /api/v1/auth/login  (username=agent, password=demo)
+  -> core/security.py login(): checks the demo user + password, then creates a
+     JWT containing {sub: "agent", role: "TRANSFER_AGENT", address: 0x7099...}.
+  -> You send this token as "Authorization: Bearer <token>" on every call.
+
+STEP 2 — SUBSCRIBE (create a buy order)
+  POST /api/v1/orders/subscribe   body: {investor: 0x15d3..., units: 50}
+  a) Router (api/v1/orders.py):
+     - require_roles(INVESTOR, TRANSFER_AGENT) checks your JWT role. OK (agent).
+     - schema OrderCreate validates: investor is a real checksum address, units > 0.
+  b) Service (services/order_service.py .subscribe):
+     - (optional) checks the Idempotency-Key so a double-click can't double-book.
+     - calls gateway.create_subscription(investor, units).
+  c) Gateway (blockchain/contract.py):
+     - _signer_for_address(investor) finds investor1's key (the backend holds it).
+     - client.send(contract.functions.createSubscriptionOrder(50), signer=investor1)
+  d) Client (blockchain/client.py): builds + signs + sends the tx (section 5B),
+     waits for the receipt.
+  e) Contract (.sol createSubscriptionOrder): checks investor is APPROVED,
+     not frozen, fund not paused; creates an Order with status PENDING; emits
+     OrderCreated(orderId, ...).
+  f) Back in the service: it reads the new order id from the event, reads the
+     order from the chain, and SAVES a copy in the DB (with your note, tx hash,
+     block number). Returns {order, receipt(tx_hash, block_number, status)}.
+  RESULT: an order exists, PENDING. No units minted yet (just like real funds).
+
+STEP 3 — SETTLE (process the order at the current price)
+  POST /api/v1/orders/5/settle   (as agent)
+  - Router: require_roles(TRANSFER_AGENT). OK.
+  - Service .settle -> gateway.settle_order(5) -> client signs with the AGENT key.
+  - Contract settleOrder(5): re-checks approval; computes price = unitPrice();
+    adds 50 units to investor1; increases totalSupply by 50; increases navTotal
+    by 50*price; marks the order SETTLED; emits OrderSettled (and the legacy
+    UnitsPurchased) event.
+  - Service updates the DB copy of the order to SETTLED and returns the receipt.
+  RESULT: investor1 now owns 50 units on-chain. GET /fund/status shows the new
+  supply, and GET /investors/0x15d3... shows balance 50 and a dollar value.
+
+STEP 4 — IT'S RECORDED FOREVER
+  - The background EventListener saw OrderCreated + OrderSettled, stored them in
+    the DB event index, and pushed them to any client connected to /ws/events.
+  - GET /audit/events lists them (with tx hash + block). GET /audit/verify/{tx}
+    re-checks the chain and confirms the off-chain copy matches the on-chain fact.
+
+
+-------------------------------------------------------------------------------
+ 7. ERRORS: how a blockchain rejection becomes a clean HTTP error
+-------------------------------------------------------------------------------
+The contract rejects bad actions with named "custom errors" (e.g. NotApproved,
+InsufficientUnlocked, NavChangeTooLarge, EnforcedPause). When web3/eth-tester
+raises such a rejection, client._to_revert() reads the 4-byte error "selector"
+from the revert data and looks up the name, then core/errors.py map_revert()
+converts it to a friendly HTTP status + message:
+
+   NotApproved            -> 409 "Investor KYC is not approved"
+   InsufficientUnlocked   -> 409 "Insufficient unlocked units (some locked)"
+   NavChangeTooLarge      -> 400 "NAV change exceeds the allowed 20% bound"
+   EnforcedPause          -> 409 "Fund is paused"
+   AccessControl...       -> 403 "Account is missing the required on-chain role"
+
+Every error comes back in one shape:
+   { "error": { "code", "message", "detail", "request_id" } }
+The request_id also appears in the JSON logs, so you can trace any request.
+
+
+-------------------------------------------------------------------------------
+ 8. EACH SERVICE, IN ONE LINE  (backend/app/services/)
+-------------------------------------------------------------------------------
+investor_service  Register investors (name/email stored OFF-chain; only address,
+                  KYC status, jurisdiction, and a hash go ON-chain). Approve/
+                  reject/revoke KYC. Merge on-chain facts + off-chain profile
+                  into the investor view you see.
+
+order_service     Create subscription/redemption orders, settle them, cancel
+                  them, list them, and do investor-to-investor transfers. Handles
+                  idempotency keys so retries don't duplicate orders.
+
+nav_service       Read fund status; update NAV (with the +/-20% guard); return
+                  NAV history from indexed NAVUpdated events.
+
+custody_service   Record LOCK/RELEASE/TRANSFER custody actions (custodian only);
+                  report positions (balance / locked / free per investor). Locked
+                  units cannot be redeemed or transferred.
+
+report_service    Build investor statements in two flavours (traditional vs
+                  blockchain-native), export them as JSON / CSV / PDF, produce
+                  the fund summary and the NAV performance series.
+
+audit_service     List indexed on-chain events; verify a transaction hash by
+                  comparing the stored (off-chain) record against the live chain.
+
+health_service    Report API + chain (connected? latest block? contract address?)
+                  + database status.
+
+
+-------------------------------------------------------------------------------
+ 9. ON-CHAIN vs OFF-CHAIN  (what lives where, and why)
+-------------------------------------------------------------------------------
+ON-CHAIN (the contract = source of truth):
+   - Unit balances, totalSupply, NAV, unit price
+   - Orders (id, type, status, units, settle price)
+   - Custody locks
+   - KYC STATUS, jurisdiction, and a KYC HASH (NOT the person's name)
+   - Roles (who is admin/agent/custodian/auditor)
+   - Events (the permanent audit trail)
+
+OFF-CHAIN (the database = fast copy + private data):
+   - Investor NAME and EMAIL (personal data must never go on a public ledger)
+   - Order notes / metadata
+   - A searchable index of every event (so lists and reports are fast)
+   - Idempotency keys and the listener's "last indexed block" bookmark
+
+Guiding rule (also enforced in code): NO personal data (PII) on chain. Only the
+address, KYC status, jurisdiction, and a hash of the KYC dossier are stored on
+chain. If the DB and the chain ever disagree, the CHAIN WINS.
+
+
+-------------------------------------------------------------------------------
+ 10. THE TWO CHAIN MODES  (why the same code runs with or without Node)
+-------------------------------------------------------------------------------
+CHAIN_MODE=inmemory (default):
+   - The blockchain runs INSIDE the Python process using eth-tester.
+   - The backend funds the dev accounts and deploys the contract at startup.
+   - Needs no Node.js, no separate node process, no wallet. One command runs all.
+
+CHAIN_MODE=hardhat:
+   - A real local node runs separately (npx hardhat node on :8545).
+   - You deploy once (scripts/deploy.js) which writes deployments/local.json.
+   - The backend connects over JSON-RPC and reads that address.
+   - Behaves like a real network; state persists while the node is running.
+
+Either way, the rest of the backend code is identical — only client.connect()
+changes how it reaches the chain.
+
+
+-------------------------------------------------------------------------------
+ 11. QUICK MENTAL MODEL TO REMEMBER
+-------------------------------------------------------------------------------
+   - Units = shares (the asset). ETH = only gas (fuel).
+   - The contract is the bank ledger; the DB is a photocopy with names on it.
+   - The backend holds everyone's keys and signs for them (that's the no-wallet trick).
+   - Reads are free questions; writes are signed transactions that cost gas.
+   - Every write emits an event; the listener files it as an audit record.
+   - Roles decide who may sign what: admin=controls, agent=operations,
+     custodian=safekeeping, auditor=read-only, investor=own trades.
+
+===============================================================================
+ END. Open the files named above next to this document to see each step in code.
+===============================================================================

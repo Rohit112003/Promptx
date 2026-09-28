@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+backend/fund.db
+backend/*.db
+
+# Node / Hardhat
+node_modules/
+artifacts/
+cache/
+coverage/
+coverage.json
+
+# Env
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend (Token/) build output & local env
+Token/dist/
+Token/.output/
+Token/.tanstack/
+Token/.nitro/
+Token/.vinxi/
+dist/
+.output/
+.tanstack/
+
+# Never commit real environment files (only .env.example is tracked)
+.env
+*/.env
+**/.env
+!.env.example
+
+# Nested git repos must not be committed as submodule links
+Token/.git/

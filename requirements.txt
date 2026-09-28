@@ -1,0 +1,29 @@
+# ---- Web framework ----
+fastapi>=0.111,<0.116          # ASGI web framework powering the REST + WebSocket API
+uvicorn[standard]>=0.30,<0.35  # ASGI server that runs the app (python -m app)
+python-multipart>=0.0.9        # parses the OAuth2 login form used by Swagger "Authorize"
+
+# ---- Validation / config ----
+pydantic>=2.7,<3               # request/response models and validation
+pydantic-settings>=2.3,<3      # env-driven application configuration (app/config.py)
+
+# ---- Blockchain ----
+web3>=6.15,<8                  # Ethereum client (contract calls, tx signing, events)
+eth-account>=0.11,<0.14        # local key signing for the dev accounts
+eth-tester>=0.11,<0.13         # in-memory EVM backend for CHAIN_MODE=inmemory
+py-evm>=0.10,<0.13             # EVM implementation used by eth-tester (PyEVMBackend)
+py-solc-x>=2.0,<3              # Solidity compiler manager (inmemory/fallback build path)
+
+# ---- Persistence ----
+aiosqlite>=0.20,<0.22          # async SQLite driver (default off-chain store)
+motor>=3.4,<4                  # async MongoDB driver (optional store, DB_MODE=mongo)
+
+# ---- Auth ----
+PyJWT>=2.8,<3                  # JWT encode/decode for role-based auth
+
+# ---- Reporting ----
+reportlab>=4.1,<5              # PDF generation for investor statements
+
+# ---- Tests ----
+pytest>=8.2,<9                 # test runner (backend/tests)
+httpx>=0.27,<0.28              # ASGI/HTTP client for the tests and the seed script

@@ -1,0 +1,4 @@
+- [x] Define typed API and realistic mock workflows
+- [x] Build responsive console pages and shared controls
+- [x] Document API mapping and verify interface
+- [x] Connect every page to the live FastAPI backend (`VITE_USE_MOCK=false`)

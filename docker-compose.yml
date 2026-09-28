@@ -1,0 +1,56 @@
+# Full stack: Hardhat node + one-shot deployer + MongoDB + backend API.
+# For the simplest local run without Docker, prefer:  python tasks.py demo
+services:
+  hardhat:
+    image: node:20
+    working_dir: /work
+    volumes:
+      - ./:/work
+      - node_modules:/work/node_modules
+    command: sh -c "npm install --no-audit --no-fund && npx hardhat node --hostname 0.0.0.0"
+    ports:
+      - "8545:8545"
+
+  deployer:
+    image: node:20
+    working_dir: /work
+    depends_on:
+      - hardhat
+    volumes:
+      - ./:/work
+      - node_modules:/work/node_modules
+    # Wait for the node, compile, then deploy and write deployments/local.json.
+    command: >
+      sh -c "sleep 8 && npx hardhat compile &&
+             npx hardhat run scripts/deploy.js --network docker"
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - deployer
+      - mongo
+    environment:
+      CHAIN_MODE: hardhat
+      RPC_URL: http://hardhat:8545
+      CHAIN_ID: "31337"
+      DB_MODE: mongo
+      MONGO_URL: mongodb://mongo:27017
+      CORS_ORIGINS: "*"
+    volumes:
+      - ./deployments:/app/deployments
+    ports:
+      - "8000:8000"
+    restart: on-failure  # retries until the deployer has written the address
+
+volumes:
+  node_modules:
+  mongo_data:

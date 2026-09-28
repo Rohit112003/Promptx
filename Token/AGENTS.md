@@ -1,0 +1,3 @@
+- Keep all fund backend calls and mock state in `src/lib/api.ts`, with contracts in `src/lib/types.ts`, so switching to the supplied API only changes the mock flag.
+- Use TanStack Start file routes rather than React Router DOM because this project is provisioned with TanStack Start; preserve the same page URLs and React/Vite experience.
+- This repo is configured as a standard Shadcn/Tailwind app, not a Lovable-generated project.
